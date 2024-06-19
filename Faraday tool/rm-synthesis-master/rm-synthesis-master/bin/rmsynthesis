@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+# -*- python -*-
+
+import os, sys, time
+
+from rmsynthesis.main import ShapeError, ParseError, compute_rmsf, write_rmsf
+from rmsynthesis.main import file_exists, proper_fits_shapes
+from rmsynthesis.main import wavelength_squared_m2_from_freq_hz
+from rmsynthesis.main import rmsynthesis_dirty_lowmem_main, parse_frequency_file
+from rmsynthesis.main import rmsynthesis_crosscorr_dirty_lowmem_main
+from rmsynthesis.main import mean_psf, mean_psf_product
+from rmsynthesis.main import RMSYNTHESIS_VERSION, __version__
+
+from numpy import arange, array, ceil, sqrt #pylint: disable=no-name-in-module
+import logging, argparse
+
+
+def initialize_logging(log_level='INFO'):
+    r'''
+    Initialize the Python logging system.
+
+    **Parameters**
+
+    log_level : string
+        Minimum log level of lines to write into the
+        log file. Possible values are 'DEBUG', 'INFO', 'WARNING', and
+        'ERROR'.
+
+    **Returns**
+
+    A tuple (logger, formatter, level).
+
+    **Examples**
+
+    >>> initialize_logging(log_level = 'INFO')
+    logger, formatter, level
+    '''
+    log_levels   = {'DEBUG'  : logging.DEBUG,
+                    'INFO'   : logging.INFO,
+                    'WARNING': logging.WARNING,
+                    'ERROR'  : logging.ERROR}
+    level = log_levels[log_level]
+    
+    log_format     = ('rmsynthesis:' +
+                      ' %(asctime)s %(levelname)8s - %(message)s')
+
+    logger       = logging.root
+    logger.setLevel(level)
+    formatter    = logging.Formatter(log_format)
+
+    for handler in logger.handlers:
+        logger.removeHandler(handler)
+
+    if len(logger.handlers) == 0:
+        stream_handler = logging.StreamHandler()
+        logger.addHandler(stream_handler)
+        
+    return logger, formatter, level
+
+
+def set_log_formats(logger, formatter, level):
+    r'''
+    Set the formatter for all loggers. Use logger, formatter, and
+    level arguments returned by initialize_logging()
+    '''
+    for handler in logger.handlers:
+        handler.setFormatter(formatter)
+        handler.setLevel(level)
+    
+
+
+
+def warn(msg):
+    r'''
+    Provide an interactive warning to the user.
+    '''
+    logging.warn(msg)
+    print('')
+    print('|' + '-'*78 + '|')
+    full_msg = '| WARNING: '+msg
+    full_msg += ' '*(79 - len(full_msg))
+    full_msg += '|'
+    print(full_msg)
+    print('|' + '-'*78 + '|')
+    print('')
+    wrong_answer = True
+    answer = ''
+    while wrong_answer:
+        sys.stdout.write('Do you wish to continue (yes, I do/no)>>> ')
+        answer = sys.stdin.readline().strip()
+        wrong_answer = answer not in ['yes, I do', 'no']
+        if len(answer) > 15:
+            sys.stdout.write('>>> stop babbling')
+            if answer[0:9] == 'yes, I do':
+                sys.stdout.write('! I will continue, though. <<<\n')
+                wrong_answer = False
+                answer = answer[0:9]
+            else:
+                sys.stdout.write(', and answer the question! <<<\n')
+            time.sleep(2)
+    if answer == 'yes, I do':
+        return True
+    else:
+        exit(-1)
+
+
+def log_summary(argv, **kwargs):
+    key_width = 15
+    def prkv(key, value):
+        logging.info(key.ljust(key_width)+': '+str(value))
+    
+    logging.info('')
+    logging.info('RM synthesis %s summary' % RMSYNTHESIS_VERSION)
+    logging.info('------------------------')
+    logging.info('')
+    logging.info('Command'.ljust(key_width)+': '+' '.join(argv))
+    if sys.version_info.major == 2 and sys.version_info.minor >= 3:
+        logging.info('Working dir'.ljust(key_width)+': '+os.getcwdu())
+    else:
+        logging.info('Working dir'.ljust(key_width)+': '+os.getcwd())
+
+    logging.info('Max mem'.ljust(key_width)+': '+'%.1f GB' % kwargs['max_mem_gb'])
+    logging.info('')
+
+    prkv('Q cube', kwargs['qname'])
+    prkv('U cube', kwargs['uname'])
+    prkv('Frequencies', kwargs['frequencyname'])
+    prkv('Q template cube', kwargs['qtemplate'])
+    prkv('U template cube', kwargs['utemplate'])
+    prkv('PSF cube', kwargs['psf_cube'])
+    prkv('Template PSF cube', kwargs['template_psf_cube'])
+    prkv('Output dir', kwargs['output_dir'])
+    prkv('Force overwrite', kwargs['force_overwrite'])
+    prkv('Check only', kwargs['check'])
+    logging.info('')
+    prkv('Low phi', kwargs['low_phi'])
+    prkv('High phi', kwargs['high_phi'])
+    prkv('Delta phi', kwargs['dphi'])
+    logging.info('')
+    prkv('Ignore frames', kwargs['ignore_frames'])
+    prkv('RM cube', kwargs['rmcube_name'])
+    prkv('RMSF', kwargs['rmsf_name'])
+    prkv('Log file', kwargs['log_name'])
+    logging.info('')
+
+
+
+
+def max_memory_gb(fraction=0.8):
+    r'''
+    Determine the maximum amount of memory available for RM synthesis.
+    '''
+    if os.path.exists('/proc/meminfo'):
+        words = [line for line in open('/proc/meminfo').readlines()
+                 if 'MemTotal'.lower() in line.lower()][0].split()[1:]
+        mem = float(words[0])
+        if words[1] == 'kB':
+            mem *= 1024
+        else:
+            raise ValueError(
+                'Do not know how to handle memory in %s' % words[1])
+        return fraction*mem/(1024**3)
+    else:
+        return 3.0
+
+
+
+
+
+
+def parse_command_line():
+    r'''
+    Parse the commandline using the argparse module.
+    '''
+    parser = argparse.ArgumentParser(epilog='''
+Input
+-----
+
+The Q and U fits cubes are required and must have three axes. The
+fastest varying axis (AXIS1) must be right ascension, the second axis
+(AXIS2) declination, and the slowest varying axis (AXIS3) is the frame
+number. The rmsynthesis script ignores frequency information in the
+FITS cubes. It only uses frequency information provided in the text
+file. Note that the order of the axes in Python/numpy is the reverse
+of that in the FITS file. That is, in Python, the first axis (axis 0)
+is the slowest varying axis. The pyfits library transparently handles
+this conversion. Note that the Q and U cubes must be similar in the
+sense that their shape and scales (ra, dec, and frame number) must be
+the same.
+
+The third required input is the list of frequencies. This must be a
+text file with one frequency per line. The frequency must be in Hz and
+can be either an integer or a floating point number. A (tiny) example:
+
+1.420e9
+1680000000
+4800000000
+
+
+If additional template Q and U cubes are provided, those cubes will be
+used to calculate the cross correlation between the RM cube from the
+input Q and U cubes and the RM cube from the template. This can be
+used to investigate spatial variations in Faraday depth between the
+template and the input.
+
+Output
+------
+
+The output files are written in the current working directory, unless
+otherwise specified with the -o option.
+
+- p-rmcube-dirty.fits FITS cube with axis RA (AXIS1), Dec (AXIS2),
+                      Faraday depth (AXIS3). Total linear polarization.
+
+- q-rmcube-dirty.fits FITS cube with axis RA (AXIS1), Dec (AXIS2),
+                      Faraday depth (AXIS3). Derotated Q.
+
+- u-rmcube-dirty.fits FITS cube with axis RA (AXIS1), Dec (AXIS2),
+                      Faraday depth (AXIS3). Derotated U.
+
+- rmsf.txt            Text file with the RM spread function. The first
+                      column is Faraday depth, the second column the
+                      response parallel to the original polarization
+                      direction (\"q\"), and the third column the
+                      response at 45 degrees with respect to the
+                      original polarization direction (\"u\").
+
+- rmsynthesis.log     Contains the command line options used to obtain
+                      this output.
+    ''',
+    formatter_class = argparse.RawDescriptionHelpFormatter)
+    arg = parser.add_argument
+    arg('qcube', metavar='QCUBE', type=str, nargs=1,
+        help='FITS file containing the Q cube.')
+    arg('ucube', metavar='UCUBE', type=str, nargs=1,
+        help='FITS file containing the U cube.')
+    arg('freq_file', metavar='FREQ_FILE', type=str, nargs=1,
+        help='Ascii file with frame frequencies.')
+    arg('template_qcube', metavar='TMPL_QCUBE', type=str, nargs='?',
+        help='FITS file containing the Q template cube (optional).')
+    arg('template_ucube', metavar='TMPL_UCUBE', type=str, nargs='?',
+        help='FITS file containing the U template cube (optional).')
+
+    arg('psf_cube', metavar='PSF_CUBE', type=str, nargs='?',
+        help='FITS file containing the PSF cube for the observation (optional).')
+    arg('template_psf_cube', metavar='TMPL_PSF_CUBE', type=str, nargs='?',
+        help='FITS file containing the PSF cube for the template (optional).')
+
+    arg('--output', '-o', metavar='DIRECTORY',
+        help    = 'Name of the output directory [%(default)s].',
+        default = '.')
+    arg('--low', metavar='PHI',
+        type=float,
+        help = '''
+Lowest Faraday depth in output cube. Default value is
+-sqrt(3)/delta (lambda^2), where delta (lambda^2) is the smallest
+one as computed from the frequency list.''',
+        default=None)
+    arg('--high', metavar='PHI',
+        type=float,
+        help = '''
+Highest Faraday depth in output cube. Default value is
++sqrt(3)/delta (lambda^2), where delta (lambda^2) is the smallest
+one as computed from the frequency list.''',
+        default=None)
+    arg('--dphi', metavar='DELTA_PHI',
+        type=float,
+        help = '''
+Faraday depth increment between frames
+from the RM cube. Default value is
+sqrt(3)/Delta (lambda^2), where Delta
+(lambda^2) is max(lambda^2) -
+min(lambda^2), computed from the
+frequency list.''',
+        default=None)
+    arg('-i', '--ignore-frames',
+        help='''
+Comma-separated list of input frames
+that must be ignored for some
+reason. The numbers are the 0-based
+indices along the slowest varying
+axis in the Q and U cubes. For example
+0,3,4,10 will ignore the first, fourth,
+fifth, and eleventh frame from the input.''',
+        default=None)
+    arg('-f', '--force', action='store_true',
+        help='''
+Force overwriting files in output directory if they
+already exist.''',
+        default=False)
+    arg('-c', '--check', action='store_true',
+        help='''
+Perform all possible checks, but do not write any files or compute an RM cube''',
+        default=False)
+    arg('-q', '--qfactor', metavar='QFACTOR',
+        type=float,
+        help='''Factor to multiply values in Q cube with,
+Default [%(default)f]''',
+        default=1.0)
+    arg('-u', '--ufactor', metavar='UFACTOR',
+        type=float,
+        help='''Factor to multiply values in U cube with,
+Default [%(default)f]. For WSRT data, this
+factor must be 1.2 if it has not already been applied.''',
+        default=1.0)
+    arg('-m', '--maxmem', metavar='GB',
+        type=float,
+        help='Maximum amount of memory to be used in GB. Default: [%(default)f]',
+        default=max_memory_gb())
+    arg('-v', '--version', action='version',
+        version = '%(prog)s ' +__version__+
+        ' (c) 2004-2014 M.A. Brentjens <brentjens@astron.nl>',
+        help = 'Print version number and exit.')
+
+    args = parser.parse_args()
+    return args, parser
+
+
+
+
+
+#
+#  MAIN routine
+#
+
+def main(argv):
+    logger, formatter, level = initialize_logging(log_level='INFO')
+    set_log_formats(logger, formatter, level)
+    args, parser = parse_command_line()
+    log_file_name = None
+    if len(argv) == 1:
+        return parser.print_help()
+    if not file_exists(args.output):
+        logging.info('output dir '+args.output+' does not yet exist; it will be created')
+    if not args.check:
+        if not file_exists(args.output):
+            os.mkdir(args.output)
+        log_file_name = os.path.join(args.output, 'rmsynthesis.log')
+        if file_exists(log_file_name):
+            if args.force:
+                warn('%s already exists; it will be overwritten' %
+                     log_file_name)
+            else:
+                logging.error('file %s already exists; use --force to overwrite' %
+                      log_file_name)
+                return -1
+        file_handler = logging.FileHandler(log_file_name)
+        logger.addHandler(file_handler)
+        set_log_formats(logger, formatter, level)
+
+    rmcube_name = os.path.join(args.output, '{p-,q-,u-}rmcube-dirty.fits')
+    rmsf_name = os.path.join(args.output, 'rmsf.txt')
+
+    input_files = [args.qcube[0], args.ucube[0], args.freq_file[0]]
+    if args.template_qcube and (args.template_ucube is None):
+        logging.error('Q template (%r) specified without U template.',
+                      args.template_qcube)
+        return -1
+    if args.template_qcube and args.template_ucube:
+        input_files += [args.template_qcube, args.template_ucube]
+
+    if args.psf_cube:
+        input_files.append(args.psf_cube)
+    if  args.template_psf_cube:
+        input_files.append(args.template_psf_cube)
+
+    files_exist = [file_exists(arg, verbose=True)
+                   for arg in input_files]
+    if not all(files_exist):
+        logging.error(
+            'Provide Q and U FITS cubes and a frequency text file (optionally Q/U templates).')
+        logging.error('-------------------------------------------------------')
+        logging.error('PARAMETER       FILE_NAME                       EXISTS?')
+        logging.error('-------------------------------------------------------')
+        for par, fname, exists in zip(['QCUBE', 'UCUBE', 'FREQ_FILE', 'TMPL_QCUBE', 'TMPL_UCUBE', 'PSF_CUBE', 'TMPL_PSF_CUBE'],
+                                      input_files, files_exist):
+            logging.error('%14s  %30s  %r', par.ljust(14), fname.ljust(30), exists)
+        logging.error('-------------------------------------------------------')
+        return -1
+
+    qname = args.qcube[0]
+    uname = args.ucube[0]
+    frequencyname = args.freq_file[0]
+    if qname == uname:
+        warn('Q name ('+qname+') and U name ('+uname+') are the same')
+    if frequencyname[-4:].lower() == 'fits':
+        warn('Frequency file ('+frequencyname+') might be a fits file')
+    if args.template_qcube and (args.template_qcube == args.template_ucube):
+        warn('Q template name ('
+             + args.template_qcube +') and U template name ('
+             + args.template_ucube +') are the same')
+
+    frequencies = parse_frequency_file(frequencyname)
+    wl2 = wavelength_squared_m2_from_freq_hz(frequencies)
+    sorted_wl2 = array(sorted(wl2))
+    smallest_dl2 = min(abs(sorted_wl2[1:] - sorted_wl2[0:-1]))
+    if abs(smallest_dl2) == 0.0:
+        logging.error('two frames have equal frequency')
+        return -1
+
+    if args.low is None:
+        low = -sqrt(3)/smallest_dl2
+    else:
+        low = args.low
+
+    if args.high is None:
+        high = +sqrt(3)/smallest_dl2
+    else:
+        high = args.high
+
+    if args.dphi is None:
+        dphi = abs(sqrt(3)/(sorted_wl2[-1]-sorted_wl2[0]))
+    else:
+        dphi = args.dphi
+        
+    ignore_frames = None
+    if args.ignore_frames is not None:
+        ignore_frames = [int(frame) for frame in args.ignore_frames.split(',')]
+    # Normalize dphi so that there is an integer number
+    # of frames between low and high (inclusive)
+    dphi_user_override = args.dphi or args.low or args.high
+    if not dphi_user_override:
+        if low < 0 and high > 0:
+            lowframes = ceil(abs(0-low)/dphi)
+            dphi = abs((0-low)*(1.0-1e-15)/(lowframes+1))
+        else:
+            ValueError('low phi limit ('+str(low)+
+                       ') must be negative and high phi limit ('+str(high)+
+                       ') positive')
+
+    if args.qfactor == 0:
+        warn('Q factor is 0.0')
+    if args.ufactor == 0:
+        warn('U factor is 0.0')
+    if args.maxmem < 0.5:
+        warn('Maximum allowed memory is < 500 MB!')
+
+    phi = arange(low, high+dphi*0.1, dphi)
+
+    #pylint: disable=bad-whitespace
+    log_summary(argv,
+                qname         = qname,
+                uname         = uname,
+                frequencyname = frequencyname,
+                qtemplate     = args.template_qcube,
+                utemplate     = args.template_ucube,
+                psf_cube      = args.psf_cube,
+                template_psf_cube = args.template_psf_cube,
+                output_dir    = args.output,
+                low_phi       = low,
+                high_phi      = high,
+                dphi          = dphi,
+                force_overwrite = args.force,
+                rmcube_name   = rmcube_name,
+                rmsf_name     = rmsf_name,
+                log_name      = log_file_name,
+                check         = args.check,
+                max_mem_gb    = args.maxmem,
+                ignore_frames = ignore_frames)
+
+    if not proper_fits_shapes(qname, uname, frequencyname):
+        return -1
+
+    # Finally, do the work...
+    if not args.check:
+        if args.template_ucube is None:
+            rmsynthesis_dirty_lowmem_main(qname, uname,
+                                          args.qfactor, args.ufactor,
+                                          args.output, frequencies,
+                                          phi, args.force,
+                                          args.maxmem,
+                                          bad_frames=ignore_frames)
+        else:
+            rmsynthesis_crosscorr_dirty_lowmem_main(
+                q_template_name=args.template_qcube,
+                u_template_name=args.template_ucube,
+                q_name=qname, u_name=uname,
+                q_factor=args.qfactor, u_factor=args.ufactor,
+                output_dir=args.output, freq_hz=frequencies,
+                phi_rad_m2=phi,
+                force_overwrite=args.force, max_mem_gb=args.maxmem,
+                bad_frames=ignore_frames)
+        rmsf = compute_rmsf(frequencies, phi)
+        write_rmsf(phi, rmsf, args.output)
+        if args.psf_cube:
+            mean_psf(args.psf_cube, frequencies,
+                     output_fits_name = os.path.join(args.output, 'mean_psf.fits'),
+                     force_overwrite=args.force,
+                     max_mem_gb=args.maxmem,
+                     bad_frames=ignore_frames)
+        if args.template_psf_cube:
+            mean_psf(args.template_psf_cube, frequencies,
+                     output_fits_name=os.path.join(args.output, 'mean_template_psf.fits'),
+                     force_overwrite=args.force,
+                     max_mem_gb=args.maxmem,
+                     bad_frames=ignore_frames)
+        if args.psf_cube and args.template_psf_cube:
+            mean_psf_product(args.psf_cube, args.template_psf_cube,
+                             frequencies,
+                             output_fits_name=os.path.join(args.output, 'mean_psf_product.fits'),
+                             force_overwrite=args.force,
+                             max_mem_gb=args.maxmem,
+                             bad_frames=ignore_frames)
+    return 0
+
+
+
+
+if __name__ == "__main__":
+    try:
+        exit(main(sys.argv))
+    except (OSError, IOError):
+        logging.error(str(sys.exc_info()[1]))
+        exit(-1)
+    except (ParseError, ShapeError):
+        logging.error(sys.exc_info()[1])
+        logging.error('use "'+sys.argv[0]+'" for help.')
+        exit(-1)
+    except (MemoryError, ):
+        logging.error(sys.exc_info()[1])
+        logging.error('The input or output cubes are too large to handle at the moment. They do ')
+        logging.error('not fit in memory together with the intermediate results. Please make the')
+        logging.error('cubes smaller, buy more RAM, or kindly ask the author for an upgrade.')
+        logging.error('use "'+sys.argv[0]+'" for help.')
+        exit(-1)
+    except (KeyboardInterrupt, ):
+        print('')
+        exit(-1)

@@ -1,0 +1,10 @@
+include README
+include MANIFEST
+include *.sh
+include MANIFEST.in
+recursive-include testdata *
+recursive-include doc *
+include doc/source/_static/
+include doc/source/_templates
+prune *~
+prune *.pyc
